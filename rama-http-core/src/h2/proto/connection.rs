@@ -285,6 +285,7 @@ where
                             // Ensure all window updates have been sent.
                             //
                             // This will also handle flushing `self.codec`
+                            tracing::trace!("doing window updates");
                             ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
 
                             if (self.inner.error.is_some()
@@ -310,6 +311,7 @@ where
                     self.inner.state = State::Closed(reason, initiator);
                 }
                 State::Closed(reason, initiator) => {
+                    tracing::trace!("connection already closed");
                     return Poll::Ready(self.take_error(reason, initiator));
                 }
             }
@@ -317,6 +319,7 @@ where
     }
 
     fn poll2(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        tracing::trace!("poll2");
         // This happens outside of the loop to prevent needing to do a clock
         // check and then comparison of the queue possibly multiple times a
         // second (and thus, the clock wouldn't have changed enough to matter).
@@ -345,14 +348,16 @@ where
                     "graceful GOAWAY should be NO_ERROR"
                 );
             }
+            tracing::trace!("polling ready");
             ready!(self.poll_ready(cx))?;
+            tracing::trace!("polling ready done");
 
-            match self
-                .inner
-                .as_dyn()
-                .recv_frame(ready!(Pin::new(&mut self.codec).poll_next(cx)?))?
-            {
+            let next_frame = Pin::new(&mut self.codec).poll_next(cx);
+            tracing::trace!(next_frame = ?next_frame);
+            let frame = self.inner.as_dyn().recv_frame(ready!(next_frame?));
+            match frame? {
                 ReceivedFrame::Settings(frame) => {
+                    println!("received settings");
                     self.inner.settings.recv_settings(
                         frame,
                         &mut self.codec,
@@ -360,14 +365,19 @@ where
                     )?;
                 }
                 ReceivedFrame::Priority(frame) => {
+                    println!("received prio");
                     self.inner.settings.recv_priority(
                         frame,
                         &mut self.codec,
                         &mut self.inner.streams,
                     )?;
                 }
-                ReceivedFrame::Continue => (),
+                ReceivedFrame::Continue => {
+                    println!("received conintue");
+                    ()
+                }
                 ReceivedFrame::Done => {
+                    println!("received done");
                     return Poll::Ready(Ok(()));
                 }
             }
@@ -590,6 +600,14 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
     B: Buf,
 {
+    pub(crate) fn is_closing(&self) -> bool {
+        if let State::Closing(..) = self.inner.state {
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn next_incoming(&mut self) -> Option<StreamRef<B>> {
         self.inner.streams.next_incoming()
     }

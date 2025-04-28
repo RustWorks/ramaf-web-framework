@@ -287,6 +287,7 @@ where
                         exec.spawn_task(fut);
                     }
                     Some(Err(e)) => {
+                        trace!(err=?e,"incoming connection error");
                         return Poll::Ready(Err(crate::Error::new_h2(e)));
                     }
                     None => {

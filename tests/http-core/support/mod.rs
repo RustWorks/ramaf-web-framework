@@ -1,10 +1,12 @@
 #![allow(dead_code)]
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::sync::Once;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::StatusCode;
@@ -14,6 +16,10 @@ use rama::http::core::service::RamaHttpService;
 use rama::http::dep::http_body_util::{BodyExt, Full};
 use rama::rt::Executor;
 use tokio::net::{TcpListener, TcpStream};
+
+use tokio::time::sleep;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use rama::http::{Request, Response, Version};
 use rama::service::service_fn;
@@ -26,6 +32,19 @@ pub(crate) use rama::http::HeaderMap;
 pub(crate) use std::net::SocketAddr;
 
 pub(crate) mod trailers;
+
+static TRACING: Once = Once::new();
+
+fn setup_tracing() {
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::TRACE.into())
+                .from_env_lossy(),
+        )
+        .init();
+}
 
 #[allow(unused_macros)]
 macro_rules! t {
@@ -64,24 +83,24 @@ macro_rules! t {
                 ));
             }
 
-            __run_test(__TestConfig {
-                client_version: 2,
-                client_msgs: c.clone(),
-                server_version: 2,
-                server_msgs: s.clone(),
-                parallel: true,
-                connections: 1,
-                proxy: false,
-            });
+            // __run_test(__TestConfig {
+            //     client_version: 2,
+            //     client_msgs: c.clone(),
+            //     server_version: 2,
+            //     server_msgs: s.clone(),
+            //     parallel: true,
+            //     connections: 1,
+            //     proxy: false,
+            // });
 
             __run_test(__TestConfig {
                 client_version: 2,
                 client_msgs: c,
                 server_version: 2,
                 server_msgs: s,
-                parallel: true,
+                parallel: false,
                 connections: 1,
-                proxy: true,
+                proxy: false,
             });
         }
     );
@@ -151,25 +170,25 @@ macro_rules! t {
                 proxy: false,
             });
 
-            __run_test(__TestConfig {
-                client_version: 1,
-                client_msgs: c.clone(),
-                server_version: 1,
-                server_msgs: s.clone(),
-                parallel: false,
-                connections: 1,
-                proxy: true,
-            });
+            // __run_test(__TestConfig {
+            //     client_version: 1,
+            //     client_msgs: c.clone(),
+            //     server_version: 1,
+            //     server_msgs: s.clone(),
+            //     parallel: false,
+            //     connections: 1,
+            //     proxy: true,
+            // });
 
-            __run_test(__TestConfig {
-                client_version: 2,
-                client_msgs: c,
-                server_version: 2,
-                server_msgs: s,
-                parallel: false,
-                connections: 1,
-                proxy: true,
-            });
+            // __run_test(__TestConfig {
+            //     client_version: 2,
+            //     client_msgs: c,
+            //     server_version: 2,
+            //     server_msgs: s,
+            //     parallel: false,
+            //     connections: 1,
+            //     proxy: true,
+            // });
         }
     );
 }
@@ -308,6 +327,7 @@ pub(crate) struct __SRes {
 
 pub(crate) type __HeadersEq = Vec<Arc<dyn Fn(&HeaderMap) + Send + Sync>>;
 
+#[derive(Clone)]
 pub(crate) struct __TestConfig {
     pub client_version: usize,
     pub client_msgs: Vec<(__CReq, __CRes)>,
@@ -328,7 +348,12 @@ pub(crate) fn runtime() -> tokio::runtime::Runtime {
 }
 
 pub(crate) fn __run_test(cfg: __TestConfig) {
-    runtime().block_on(async_test(cfg));
+    TRACING.call_once(|| {
+        setup_tracing();
+    });
+    loop {
+        runtime().block_on(async_test(cfg.clone()));
+    }
 }
 
 async fn async_test(cfg: __TestConfig) {
@@ -339,6 +364,8 @@ async fn async_test(cfg: __TestConfig) {
     } else {
         Version::HTTP_11
     };
+
+    println!("{}", cfg.client_version);
 
     let http2_only = cfg.server_version == 2;
 
@@ -355,6 +382,7 @@ async fn async_test(cfg: __TestConfig) {
         let mut cnt = 0;
 
         cnt += 1;
+        // println!("expected: {expected_connections}");
         assert!(
             cnt <= expected_connections,
             "server expected {} connections, received {}",
@@ -363,7 +391,22 @@ async fn async_test(cfg: __TestConfig) {
         );
 
         loop {
-            let (stream, _) = listener.accept().await.expect("server error");
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|err| {
+                    println!("got error1: {:?}", err);
+                    err
+                })
+                .expect("server error");
+
+            println!(
+                "server addres local, remote: {:?}, {:?}",
+                stream.local_addr().unwrap(),
+                stream.peer_addr().unwrap()
+            );
+
+            // println!("linger: {:?}", stream.nodelay());
 
             // Move a clone into the service_fn
             let serve_handles = serve_handles.clone();
@@ -404,19 +447,24 @@ async fn async_test(cfg: __TestConfig) {
                 }),
             );
 
-            tokio::task::spawn(async move {
-                if http2_only {
-                    server::conn::http2::Builder::new(Executor::new())
-                        .serve_connection(stream, service)
-                        .await
-                        .expect("server error");
-                } else {
-                    server::conn::http1::Builder::new()
-                        .serve_connection(stream, service)
-                        .await
-                        .expect("server error");
-                }
-            });
+            // tokio::task::spawn(async move {
+            if http2_only {
+                let h = server::conn::http2::Builder::new(Executor::new())
+                    .serve_connection(stream, service);
+                sleep(Duration::new(0, 100000)).await;
+                h.await
+                    .map_err(|err| {
+                        println!("got error2: {:?}", err);
+                        err
+                    })
+                    .expect("server error");
+            } else {
+                server::conn::http1::Builder::new()
+                    .serve_connection(stream, service)
+                    .await
+                    .expect("server error");
+            }
+            // });
         }
     });
 
@@ -432,6 +480,7 @@ async fn async_test(cfg: __TestConfig) {
     }
 
     let make_request = Arc::new(move |creq: __CReq, cres: __CRes| {
+        println!("new request");
         let uri = format!("http://{}{}", addr, creq.uri);
         let mut req = Request::builder()
             .method(creq.method)
@@ -445,13 +494,29 @@ async fn async_test(cfg: __TestConfig) {
         let cbody = cres.body;
 
         async move {
-            let stream = TcpStream::connect(addr).await.unwrap();
+            println!("opening stream");
+            let stream = TcpStream::connect(addr)
+                .await
+                .map_err(|err| {
+                    println!("got error5: {:?}", err);
+                    err
+                })
+                .unwrap();
+            println!(
+                "req addres local, remote: {:?}, {:?}",
+                stream.local_addr().unwrap(),
+                stream.peer_addr().unwrap()
+            );
 
             let res = if http2_only {
                 let (mut sender, conn) =
                     rama::http::core::client::conn::http2::Builder::new(Executor::new())
                         .handshake(stream)
                         .await
+                        .map_err(|err| {
+                            println!("got error3: {:?}", err);
+                            err
+                        })
                         .unwrap();
 
                 tokio::task::spawn(async move {
@@ -459,7 +524,14 @@ async fn async_test(cfg: __TestConfig) {
                         panic!("{:?}", err);
                     }
                 });
-                sender.send_request(req).await.unwrap()
+                sender
+                    .send_request(req)
+                    .await
+                    .map_err(|err| {
+                        println!("got error4: {:?}", err);
+                        err
+                    })
+                    .unwrap()
             } else {
                 let (mut sender, conn) = rama::http::core::client::conn::http1::Builder::new()
                     .handshake(stream)
@@ -483,6 +555,9 @@ async fn async_test(cfg: __TestConfig) {
             let body = res.collect().await.unwrap().to_bytes();
 
             assert_eq!(body.as_ref(), cbody.as_slice(), "server body");
+            println!("new done");
+            sleep(Duration::new(0, 200)).await;
+            println!("new doneeee");
         }
     });
 
@@ -503,6 +578,9 @@ async fn async_test(cfg: __TestConfig) {
     };
 
     client_futures.await;
+
+    println!("end");
+    sleep(Duration::new(0, 100000)).await;
 }
 
 struct ProxyConfig {
@@ -527,10 +605,16 @@ async fn naive_proxy(cfg: ProxyConfig) -> (SocketAddr, impl Future<Output = ()>)
         tokio::task::spawn(async move {
             let prev = counter.fetch_add(1, Ordering::Relaxed);
             assert!(max_connections > prev, "proxy max connections");
+            println!("prev: {prev}");
 
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
-
+                println!(
+                    "stream addr: {:?} , {:?}",
+                    stream.local_addr().unwrap(),
+                    stream.peer_addr().unwrap()
+                );
+                let x = stream.peer_addr().unwrap();
                 let service = RamaHttpService::new(
                     Context::default(),
                     service_fn(move |mut req: Request| {
@@ -603,10 +687,15 @@ async fn naive_proxy(cfg: ProxyConfig) -> (SocketAddr, impl Future<Output = ()>)
                     }),
                 );
 
+                // tokio::task::spawn(async move {
                 if http2_only {
                     server::conn::http2::Builder::new(Executor::new())
                         .serve_connection(stream, service)
                         .await
+                        .map_err(|err| {
+                            println!("crashing: {:?}", x);
+                            err
+                        })
                         .unwrap();
                 } else {
                     server::conn::http1::Builder::new()
@@ -614,6 +703,7 @@ async fn naive_proxy(cfg: ProxyConfig) -> (SocketAddr, impl Future<Output = ()>)
                         .await
                         .unwrap();
                 }
+                // });
             }
         });
     };

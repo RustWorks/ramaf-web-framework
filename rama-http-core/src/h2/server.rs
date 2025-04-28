@@ -424,12 +424,20 @@ where
     ) -> Poll<Option<Result<(Request<RecvStream>, SendResponse<B>), crate::h2::Error>>> {
         // Always try to advance the internal state. Getting Pending also is
         // needed to allow this function to return Pending.
+        tracing::trace!("accept poll");
         if self.poll_closed(cx)?.is_ready() {
             // If the socket is closed, don't return anything
             // TODO: drop any pending streams
+            tracing::trace!("polling ready ready");
             return Poll::Ready(None);
         }
 
+        // Dont accept new connections when closing but instead progress closing
+        if self.connection.is_closing() {
+            return Poll::Pending;
+        }
+
+        tracing::trace!("getting next incomming");
         if let Some(inner) = self.connection.next_incoming() {
             tracing::trace!("received incoming");
             let (head, _) = inner.take_request().into_parts();
